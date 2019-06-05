@@ -5,6 +5,9 @@
 #include "cluon-complete.hpp"
 #include "opendlv-standard-message-set.hpp"
 
+#include <vpx/vpx_decoder.h>
+#include <vpx/vp8dx.h>
+
 #include <libyuv.h>
 #include <X11/Xlib.h>
 
@@ -45,7 +48,8 @@ int32_t main(int32_t argc, char **argv) {
         if (!recFile.empty() && fin.good()) {
             fin.close();
 
-//            std::unique_ptr<NvDecoder> decoder{nullptr};
+            vpx_codec_ctx_t codec;
+            std::string format{""};
 
             // Interface to a running OpenDaVINCI session (ignoring any incoming Envelopes).
             cluon::OD4Session od4{static_cast<uint16_t>(std::stoi(commandlineArguments["cid"]))};
@@ -57,7 +61,7 @@ int32_t main(int32_t argc, char **argv) {
             Window window{0};
             XImage *ximage{nullptr};
 
-            auto onNewImage = [&isIDset, &sharedMemory, &display, &visual, &window, &ximage, &NAME, &VERBOSE, &ID](cluon::data::Envelope &&env){
+            auto onNewImage = [&isIDset, &codec, &format, &sharedMemory, &display, &visual, &window, &ximage, &NAME, &VERBOSE, &ID](cluon::data::Envelope &&env){
                 if (!isIDset) {
                     isIDset = true;
                     ID = env.senderStamp();
@@ -66,53 +70,83 @@ int32_t main(int32_t argc, char **argv) {
                 if (ID == env.senderStamp()) {
                     cluon::data::TimeStamp sampleTimeStamp = env.sampleTimeStamp();
                     opendlv::proxy::ImageReading img = cluon::extractMessage<opendlv::proxy::ImageReading>(std::move(env));
-                    if ("h264" == img.fourcc()) {
+
+                    if ( ("VP80" == img.fourcc()) || ("VP90" == img.fourcc()) ) {
                         const uint32_t WIDTH = img.width();
                         const uint32_t HEIGHT = img.height();
 
-                        if (!sharedMemory) {
-                            std::clog << "[video-vpx-replay]: Created shared memory " << NAME << " (" << (WIDTH * HEIGHT * 4) << " bytes) for an ARGB image (width = " << WIDTH << ", height = " << HEIGHT << ")." << std::endl;
-                            sharedMemory.reset(new cluon::SharedMemory{NAME, WIDTH * HEIGHT * 4});
-                            if (VERBOSE) {
-                                display = XOpenDisplay(NULL);
-                                visual = DefaultVisual(display, 0);
-                                window = XCreateSimpleWindow(display, RootWindow(display, 0), 0, 0, WIDTH, HEIGHT, 1, 0, 0);
-                                ximage = XCreateImage(display, visual, 24, ZPixmap, 0, reinterpret_cast<char*>(sharedMemory->data()), WIDTH, HEIGHT, 32, 0);
-                                XMapWindow(display, window);
+                        if (!sharedMemory || (format != img.fourcc())) {
+                            vpx_codec_err_t result{};
+                            // Release any previous codecs.
+                            if (!format.empty()) {
+                                vpx_codec_destroy(&codec);
                             }
+                            memset(&codec, 0, sizeof(codec));
+                            if ("VP80" == img.fourcc()) {
+                                result = vpx_codec_dec_init(&codec, &vpx_codec_vp8_dx_algo, nullptr, 0);
+                                if (!result) {
+                                    std::clog << "[video-vpx-replay]: Using " << vpx_codec_iface_name(&vpx_codec_vp8_dx_algo) << std::endl;
+                                }
+                            }
+                            if ("VP90" == img.fourcc()) {
+                                result = vpx_codec_dec_init(&codec, &vpx_codec_vp9_dx_algo, nullptr, 0);
+                                if (!result) {
+                                    std::clog << "[video-vpx-replay]: Using " << vpx_codec_iface_name(&vpx_codec_vp9_dx_algo) << std::endl;
+                                }
+                            }
+                            if (result) {
+                                std::cerr << "[video-vpx-replay]: Failed to initialize decoder: " << vpx_codec_err_to_string(result) << std::endl;
+                                cluon::TerminateHandler::instance().isTerminated.store(true);
+                            }
+                            else {
+                                if (!sharedMemory) {
+                                    sharedMemory.reset(new cluon::SharedMemory{NAME, WIDTH * HEIGHT * 4});
+                                    if (!sharedMemory && !sharedMemory->valid()) {
+                                        std::cerr << "[video-vpx-replay]: Failed to create shared memory." << std::endl;
+                                        cluon::TerminateHandler::instance().isTerminated.store(true);
+                                    }
+                                    else {
+                                        std::clog << "[video-vpx-replay]: Created shared memory " << NAME << " (" << (WIDTH * HEIGHT * 4) << " bytes) for an ARGB image (width = " << WIDTH << ", height = " << HEIGHT << ")." << std::endl;
+                                    }
+
+                                    if (VERBOSE) {
+                                        display = XOpenDisplay(NULL);
+                                        visual = DefaultVisual(display, 0);
+                                        window = XCreateSimpleWindow(display, RootWindow(display, 0), 0, 0, WIDTH, HEIGHT, 1, 0, 0);
+                                        ximage = XCreateImage(display, visual, 24, ZPixmap, 0, reinterpret_cast<char*>(sharedMemory->data()), WIDTH, HEIGHT, 32, 0);
+                                        XMapWindow(display, window);
+                                    }
+                                }
+                            }
+
+                            // Continue decoding for this given format.
+                            format = img.fourcc();
                         }
 
-                        bool printVideoInformation{false};
-//                        if (nullptr == decoder) {
-//                            printVideoInformation = true;
-//                            decoder.reset(new NvDecoder(cuContext, WIDTH, HEIGHT, false, cudaVideoCodec_H264));
-//                        }
+                        if (sharedMemory) {
+                            vpx_codec_iter_t it{nullptr};
+                            vpx_image_t *yuvFrame{nullptr};
 
-                        if (sharedMemory /* && decoder*/) {
                             std::string data{img.data()};
                             const uint32_t LEN{static_cast<uint32_t>(data.size())};
 
-                            if (printVideoInformation) {
-//                                std::cerr << "[video-vpx-replay]: " << std::endl << decoder->GetVideoInfo() << std::endl;
+                            if (vpx_codec_decode(&codec, reinterpret_cast<const unsigned char*>(data.c_str()), LEN, nullptr, 0)) {
+                                std::cerr << "[video-vpx-replay]: Decoding for current frame failed." << std::endl;
                             }
-
-//                            if (0 == nFrameReturned) {
-//                                std::cerr << "h264 decoding for current frame failed." << std::endl;
-//                            }
-//                            else {
-                                sharedMemory->lock();
-                                sharedMemory->setTimeStamp(sampleTimeStamp);
-                                {
-////                                        Nv12ToBgra32(static_cast<uint8_t*>(ppFrame[i]), decoder->GetWidth(), reinterpret_cast<uint8_t*>(sharedMemory->data()), WIDTH * 4, WIDTH, HEIGHT);
-//                                        libyuv::NV12ToARGB(static_cast<uint8_t*>(ppFrame[i]), WIDTH, static_cast<uint8_t*>(ppFrame[i])+(WIDTH*HEIGHT), WIDTH, reinterpret_cast<uint8_t*>(sharedMemory->data()), WIDTH * 4, WIDTH, HEIGHT);
-
+                            else {
+                                while (nullptr != (yuvFrame = vpx_codec_get_frame(&codec, &it))) {
+                                    sharedMemory->lock();
+                                    sharedMemory->setTimeStamp(sampleTimeStamp);
+                                    {
+                                        libyuv::I420ToARGB(yuvFrame->planes[VPX_PLANE_Y], yuvFrame->stride[VPX_PLANE_Y], yuvFrame->planes[VPX_PLANE_U], yuvFrame->stride[VPX_PLANE_U], yuvFrame->planes[VPX_PLANE_V], yuvFrame->stride[VPX_PLANE_V], reinterpret_cast<uint8_t*>(sharedMemory->data()), WIDTH * 4, WIDTH, HEIGHT);
                                         if (VERBOSE) {
                                             XPutImage(display, window, DefaultGC(display, 0), ximage, 0, 0, 0, 0, WIDTH, HEIGHT);
                                         }
+                                    }
+                                    sharedMemory->unlock();
+                                    sharedMemory->notifyAll();
                                 }
-                                sharedMemory->unlock();
-                                sharedMemory->notifyAll();
-//                            }
+                            }
                         }
                     }
                 }
